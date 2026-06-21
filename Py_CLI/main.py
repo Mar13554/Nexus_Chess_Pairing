@@ -1,0 +1,285 @@
+import os, sys
+from pathlib import Path
+from json_func import read_jfile, write_jfile
+from pair_engine import pair
+
+def resource_path(relative_path):
+    if hasattr(sys, "_MEIPASS"): base_path = os.path.dirname(sys._MEIPASS)
+    else: base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+# Get Files
+folder_dir = resource_path("Tournaments")
+
+# Coloured Text
+from colorama import Fore
+CLR_PRIMARY = lambda text: Fore.BLUE + text    # Blue
+CLR_SUCCESS = lambda text: Fore.GREEN + text   # Green
+CLR_WARNING = lambda text: Fore.YELLOW + text  # Yellow
+CLR_ERROR = lambda text: Fore.RED + text       # Red
+CLR_INFO = lambda text: Fore.CYAN + text       # Cyan
+
+# Global state tracker
+tournament_state = {
+    "players": {},           # id/name -> player data
+    "max_length": 0,
+    "pairing_mode": "swiss",  # "swiss" or "casual" (no color parity)
+    "Rounds": []
+}
+
+res_dict = {-1: "  ---  ", 0: " 0 - 1 ", 0.5: "1/2-1/2", 1: " 1 - 0 "}
+res_str = lambda res: res_dict[res]
+class Round:
+    def __init__(self): self.white = []; self.black = []; self.result = []; self.completed = False
+    def generate(self):
+        self.white, self.black = pair(tournament_state["players"], tournament_state["pairing_mode"])
+        self.result = [-1 for i in self.white]
+        if "BYE" in self.black: self.result[-1] = 1
+    def result_add(self, row_id, res): self.result[row_id] = res
+    def is_done(self): return -1 not in self.result
+
+# Command Functions
+
+def cmd_help(args):
+    print("\n", CLR_PRIMARY("=== Chess Pairing Software Manual ==="))
+    print(CLR_INFO("Format: [Number/Keyword] <Arguments>\n"))
+
+    commands_help = [
+        ("0", "mode", "<swiss/casual>", "Toggles color parity requirement"),
+        ("1", "add", "<name> <rating>", "Registers a new player to the pool"),
+        ("2", "list", "", "Prints players and result statistics"),
+        ("3", "gen", "", "Validates entries and generates next round pairings"),
+        ("4", "res", "<id row> <res>", "Records match result for white (1, 0, 0.5)"),
+        ("5", "show", "", "Prints current round"),
+        ("6", "end", "", "Ends the current round and updates scores"),
+        ("s", "save", "<name>", "Saves the current tournament settings"),
+        ("l", "load", "<name>", "Loads from a save in the 'Tournaments' folder"),
+        ("o", "loadlist", "", "Displays the list of saves in the 'Tournaments' folder"),
+        ("h", "help", "", "Displays this instruction manual"),
+        ("q", "exit", "", "Terminates the program safety")
+    ]
+
+    for num, kw, args_syntax, desc in commands_help:
+        print(f"  [{num}] {kw:<8} {args_syntax:<20} - {desc}")
+    print()
+
+def cmd_toggle_mode(args):
+    if not args:
+        print(CLR_INFO(f"Current mode: {tournament_state['pairing_mode']}"))
+        return
+    mode = args[0].lower()
+    if mode in ["swiss", "casual"]:
+        tournament_state["pairing_mode"] = mode
+        print(CLR_SUCCESS(f"Pairing mode updated to: {mode}"))
+    else: print(CLR_ERROR(f"Error: Unknown mode '{mode}'. Use 'swiss' or 'casual'."))
+
+def cmd_exit(args):
+    print(CLR_INFO("Exiting pairing software. Goodbye!"))
+    sys.exit(0)
+
+def cmd_add_player(args):
+    if len(args) < 1:
+        print(CLR_ERROR("Error: 'add' requires at least a player name. Usage: add <name> [rating]"))
+        return
+
+    name = args[0]
+    rating = int(args[1]) if len(args) > 1 and args[1].isdigit() else 1200
+
+    if name in tournament_state["players"]:
+        print(CLR_WARNING(f"Warning: Player '{name}' is already registered."))
+        return
+
+    if len(name) > tournament_state["max_length"]: tournament_state["max_length"] = len(name)
+    tournament_state["players"][name] = {
+        "rating": rating,
+        "score": 0.0,
+        "opponents": set(),
+        "color_history": []
+    }
+    print(CLR_SUCCESS(f"Success: Added {name} (Rating: {rating})"))
+
+def cmd_list_players(args):
+    if not tournament_state["players"]: print(CLR_WARNING("No players registered.")); return
+
+    col_name = max(tournament_state["max_length"], len("Player"))
+    header = f"{'Player':<{col_name}} | Rating | Score | Games | Colors  | Buchholz"
+    separator = "-" * len(header)
+    text = f"Standings\n{separator}\n{header}\n{separator}\n"
+
+    sorted_players = sorted(
+        tournament_state["players"].items(),
+        key=lambda x: (x[1]["score"], x[1]["rating"]),
+        reverse=True
+    )
+
+    for name, v in sorted_players:
+        history = v["color_history"]
+        games = len(history)
+        colors = f"W:{history.count('W')} B:{history.count('B')}" if games > 0 else "  —  "
+        buchholz = sum(tournament_state["players"][opp]["score"] for opp in v["opponents"])
+        text += f"{name:<{col_name}} | {v['rating']:>6} | {v['score']:>5} | {games:>5} | {colors:<7} | {buchholz:.1f}\n"
+
+    print(CLR_INFO(text))
+
+rev_score = {0 : 1, 0.5 : 0.5, 1 : 0}
+def cmd_generate_round(args):
+    num_rounds = len(tournament_state["Rounds"])
+    # If there is a previous round, check it is set as completed
+    if num_rounds > 0:
+        previous_round = tournament_state["Rounds"][-1]
+        if not previous_round.completed: print(CLR_WARNING("Previous round not completed. Use command 'end' to end the previous round.")); return
+
+    # Generate
+    new_round = Round()
+    new_round.generate()
+    tournament_state["Rounds"].append(new_round)
+    print(CLR_SUCCESS("Round Generated!"))
+
+def cmd_result_change(args):
+    if len(args) != 2: print(CLR_WARNING("Expected two arguments <id row> and <result>.")); return
+    if float(args[1]) not in [1, 0, 0.5]: print(CLR_WARNING("<result> should be 0, 1, or 0.5 (from white's perspective).")); return
+    if len(tournament_state["Rounds"][-1].result) < int(args[0]): print(CLR_WARNING("Row id does not exist.")); return
+    tournament_state["Rounds"][-1].result_add(int(args[0])-1, float(args[1]))
+
+def cmd_show_round(args):
+    num_rounds = len(tournament_state["Rounds"])
+    if num_rounds == 0: print(CLR_WARNING("No current rounds.")); return
+
+    current_round = tournament_state["Rounds"][-1]
+    num_rows = len(current_round.white)
+    text_margin = max((len(p) for p in current_round.white), default=0)
+
+    header = f"Round {num_rounds}"
+    separator = "-" * max(len(header), text_margin + 20)
+    text = f"{header}\n{separator}\n"
+
+    for row in range(num_rows):
+        text += str(row + 1) + ") " + current_round.white[row] + (text_margin - len(current_round.white[row])) * " " + " | " + res_str(current_round.result[row]) + f" | {current_round.black[row]}\n"
+    print(CLR_INFO(text))
+
+def cmd_end_round(args):
+    num_rounds = len(tournament_state["Rounds"])
+    # If there is a round, verify it is completed
+    if num_rounds > 0:
+        current_round = tournament_state["Rounds"][-1]
+        if not current_round.is_done(): print(CLR_WARNING("Round results not filled, unable to end round.")); return
+        if current_round.completed: print(CLR_WARNING("Round already ended.")); return
+        # Update Values (Colour History and Scores)
+        for i in range(0, len(current_round.white)):
+            white_player_name = current_round.white[i]; black_player_name = current_round.black[i]
+            tournament_state["players"][white_player_name]["score"] += current_round.result[i]
+            tournament_state["players"][white_player_name]["color_history"] += ["W"]
+            if black_player_name != "BYE":
+                tournament_state["players"][black_player_name]["score"] += rev_score[current_round.result[i]]
+                tournament_state["players"][black_player_name]["color_history"] += ["B"]
+        current_round.completed = True
+        print(CLR_SUCCESS("Round Ended!"))
+    else: print(CLR_ERROR("No round to end."))
+
+def cmd_save_state(args):
+    # Create a 'deep' copy structure for serialization
+    serialized_state = {
+        "players": {},
+        "max_length": tournament_state["max_length"],
+        "pairing_mode": tournament_state["pairing_mode"],
+        "Rounds": []
+    }
+
+    # Convert player sets to lists
+    for name, player_data in tournament_state["players"].items():
+        serialized_state["players"][name] = {
+            "rating": player_data["rating"],
+            "score": player_data["score"],
+            "opponents": list(player_data["opponents"]),  # set -> list
+            "color_history": player_data["color_history"]
+        }
+
+    # Convert Round objects to dictionaries
+    for r in tournament_state["Rounds"]:
+        serialized_state["Rounds"].append({
+            "white": r.white,
+            "black": r.black,
+            "result": r.result,
+            "completed": r.completed
+        })
+
+    file_name = os.path.join(folder_dir, args[0])
+    write_jfile(file_name, serialized_state)
+    print(CLR_INFO(f"Saved as {file_name} successfully!"))
+
+def cmd_load_state(args):
+    global tournament_state
+    file_name = os.path.join(folder_dir, args[0])
+    data = read_jfile(file_name)
+    # Reconstruct primitive data
+    tournament_state["max_length"] = data["max_length"]
+    tournament_state["pairing_mode"] = data["pairing_mode"]
+
+    # Reconstruct players and convert lists back to sets
+    tournament_state["players"] = {}
+    for name, player_data in data["players"].items():
+        tournament_state["players"][name] = {
+            "rating": player_data["rating"],
+            "score": player_data["score"],
+            "opponents": set(player_data["opponents"]),  # list -> set
+            "color_history": player_data["color_history"]
+        }
+
+    # Reconstruct Round class instances
+    tournament_state["Rounds"] = []
+    for round_data in data["Rounds"]:
+        r = Round()
+        r.white = round_data["white"]; r.black = round_data["black"]
+        r.result = round_data["result"]; r.completed = round_data["completed"]
+        tournament_state["Rounds"].append(r)
+    print(CLR_INFO(f"Loaded from {file_name} successfully!"))
+
+def cmd_loadlist(args):
+    path = Path(folder_dir)
+    print(CLR_INFO("Saves\n---------------"))
+    for item in path.iterdir():
+        print(item.name)
+
+# Command Dictionary
+    # Both the string keyword and number point to the exact same function memory address.
+COMMAND_MAP = {
+    "0": cmd_toggle_mode, "mode": cmd_toggle_mode,
+    "1": cmd_add_player, "add": cmd_add_player,
+    "2": cmd_list_players, "list": cmd_list_players,
+    "3": cmd_generate_round, "gen": cmd_generate_round,
+    "4": cmd_result_change, "res": cmd_result_change,
+    "5": cmd_show_round, "show": cmd_show_round,
+    "6": cmd_end_round, "end": cmd_end_round,
+    "h": cmd_help, "help": cmd_help,
+    "s": cmd_save_state, "save": cmd_save_state,
+    "l": cmd_load_state, "load": cmd_load_state,
+    "o": cmd_loadlist, "loadlist": cmd_loadlist,
+    "q": cmd_exit, "exit": cmd_exit,
+}
+
+# Main Loop
+def main():
+    print(CLR_SUCCESS("Nexus Chess Pairing (CLI V.1) Initialized."))
+    print("Type 'h' or 'help' to see available commands.\n")
+
+    while True:
+        try:
+            # Command indicator
+            user_raw = input(f"{CLR_PRIMARY("pairing-engine>")} ").strip()
+            if not user_raw: continue
+
+            # Split input by spaces
+            tokens = user_raw.split()
+            command_token = tokens[0].lower()
+            arguments = tokens[1:]
+
+            # Map execution
+            if command_token in COMMAND_MAP:
+                COMMAND_MAP[command_token](arguments)
+            else: print(CLR_ERROR(f"Unknown command '{command_token}'. Type 'help' for options."))
+        except (KeyboardInterrupt, EOFError):
+            print("\n")
+            cmd_exit([])
+
+if __name__ == "__main__":
+    main()
