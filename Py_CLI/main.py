@@ -55,6 +55,7 @@ def cmd_help(args):
         ("s", "save", "<name>", "Saves the current tournament settings"),
         ("l", "load", "<name>", "Loads from a save in the 'Tournaments' folder"),
         ("o", "loadlist", "", "Displays the list of saves in the 'Tournaments' folder"),
+        ("e", "export", "<name>", "Exports current round to html in 'Exports' folder"),
         ("h", "help", "", "Displays this instruction manual"),
         ("q", "exit", "", "Terminates the program safety")
     ]
