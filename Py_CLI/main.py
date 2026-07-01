@@ -3,7 +3,7 @@ from pathlib import Path
 from json_func import read_jfile, write_jfile
 from pair_engine import pair
 
-def resource_path(relative_path):
+def resource_path(relative_path: str) -> str:
     if hasattr(sys, "_MEIPASS"): base_path = os.path.dirname(sys._MEIPASS)
     else: base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
@@ -32,7 +32,8 @@ res_str = lambda res: res_dict[res]
 class Round:
     def __init__(self): self.white = []; self.black = []; self.result = []; self.completed = False
     def generate(self):
-        self.white, self.black = pair(tournament_state["players"], tournament_state["pairing_mode"])
+        active = {k: v for k, v in tournament_state["players"].items() if not v.get("suspended", False)}
+        self.white, self.black = pair(active, tournament_state["pairing_mode"])
         self.result = [-1 for i in self.white]
         if "BYE" in self.black: self.result[-1] = 1
     def result_add(self, row_id, res): self.result[row_id] = res
@@ -52,6 +53,7 @@ def cmd_help(args):
         ("4", "res", "<id row> <res>", "Records match result for white (1, 0, 0.5)"),
         ("5", "show", "", "Prints current round"),
         ("6", "end", "", "Ends the current round and updates scores"),
+        ("7", "suspend", "<name>", "Toggles player suspension from future pairings"),
         ("s", "save", "<name>", "Saves the current tournament settings"),
         ("l", "load", "<name>", "Loads from a save in the 'Tournaments' folder"),
         ("o", "loadlist", "", "Displays the list of saves in the 'Tournaments' folder"),
@@ -95,7 +97,8 @@ def cmd_add_player(args):
         "rating": rating,
         "score": 0.0,
         "opponents": set(),
-        "color_history": []
+        "color_history": [],
+        "suspended": False
     }
     print(CLR_SUCCESS(f"Success: Added {name} (Rating: {rating})"))
 
@@ -109,7 +112,11 @@ def cmd_list_players(args):
 
     sorted_players = sorted(
         tournament_state["players"].items(),
-        key=lambda x: (x[1]["score"], x[1]["rating"]),
+        key=lambda x: (
+            x[1]["score"],
+            sum(tournament_state["players"][opp]["score"] for opp in x[1]["opponents"] if opp != "BYE"),
+            x[1]["rating"]
+        ),
         reverse=True
     )
 
@@ -117,8 +124,9 @@ def cmd_list_players(args):
         history = v["color_history"]
         games = len(history)
         colors = f"W:{history.count('W')} B:{history.count('B')}" if games > 0 else "  —  "
-        buchholz = sum(tournament_state["players"][opp]["score"] for opp in v["opponents"])
-        text += f"{name:<{col_name}} | {v['rating']:>6} | {v['score']:>5} | {games:>5} | {colors:<7} | {buchholz:.1f}\n"
+        buchholz = sum(tournament_state["players"][opp]["score"] for opp in v["opponents"] if opp != "BYE")
+        suspended_mark = " [SUSPENDED]" if v.get("suspended", False) else ""
+        text += f"{name:<{col_name}} | {v['rating']:>6} | {v['score']:>5} | {games:>5} | {colors:<7} | {buchholz:.1f}{suspended_mark}\n"
 
     print(CLR_INFO(text))
 
@@ -130,6 +138,9 @@ def cmd_generate_round(args):
         previous_round = tournament_state["Rounds"][-1]
         if not previous_round.completed: print(CLR_WARNING("Previous round not completed. Use command 'end' to end the previous round.")); return
 
+    active = [k for k, v in tournament_state["players"].items() if not v.get("suspended", False)]
+    if len(active) < 2: print(CLR_ERROR("Error: At least 2 active players are required to generate a round.")); return
+
     # Generate
     new_round = Round()
     new_round.generate()
@@ -138,9 +149,13 @@ def cmd_generate_round(args):
 
 def cmd_result_change(args):
     if len(args) != 2: print(CLR_WARNING("Expected two arguments <id row> and <result>.")); return
-    if float(args[1]) not in [1, 0, 0.5]: print(CLR_WARNING("<result> should be 0, 1, or 0.5 (from white's perspective).")); return
+    if not args[0].isdigit(): print(CLR_WARNING("<id row> must be a whole number.")); return
+    if not tournament_state["Rounds"]: print(CLR_WARNING("No rounds exist yet.")); return
+    try: result_val = float(args[1])
+    except ValueError: print(CLR_WARNING("<result> should be 0, 1, or 0.5 (from white's perspective).")); return
+    if result_val not in [1, 0, 0.5]: print(CLR_WARNING("<result> should be 0, 1, or 0.5 (from white's perspective).")); return
     if len(tournament_state["Rounds"][-1].result) < int(args[0]): print(CLR_WARNING("Row id does not exist.")); return
-    tournament_state["Rounds"][-1].result_add(int(args[0])-1, float(args[1]))
+    tournament_state["Rounds"][-1].result_add(int(args[0])-1, result_val)
 
 def cmd_show_round(args):
     num_rounds = len(tournament_state["Rounds"])
@@ -158,6 +173,11 @@ def cmd_show_round(args):
         text += str(row + 1) + ") " + current_round.white[row] + (text_margin - len(current_round.white[row])) * " " + " | " + res_str(current_round.result[row]) + f" | {current_round.black[row]}\n"
     print(CLR_INFO(text))
 
+ELO_K = 32
+def calc_elo(rating_a, rating_b, score_a):
+    expected = 1 / (1 + 10 ** ((rating_b - rating_a) / 400))
+    return round(ELO_K * (score_a - expected))
+
 def cmd_end_round(args):
     num_rounds = len(tournament_state["Rounds"])
     # If there is a round, verify it is completed
@@ -171,13 +191,39 @@ def cmd_end_round(args):
             tournament_state["players"][white_player_name]["score"] += current_round.result[i]
             tournament_state["players"][white_player_name]["color_history"] += ["W"]
             if black_player_name != "BYE":
+                tournament_state["players"][white_player_name]["opponents"].add(black_player_name)
+                tournament_state["players"][black_player_name]["opponents"].add(white_player_name)
                 tournament_state["players"][black_player_name]["score"] += rev_score[current_round.result[i]]
                 tournament_state["players"][black_player_name]["color_history"] += ["B"]
+            else: tournament_state["players"][white_player_name]["opponents"].add("BYE")
+
+        # Update Elo
+        elo_changes = {}
+        for i in range(len(current_round.white)):
+            white_name = current_round.white[i]; black_name = current_round.black[i]
+            if black_name == "BYE": continue
+            w_change = calc_elo(tournament_state["players"][white_name]["rating"],
+                                tournament_state["players"][black_name]["rating"],
+                                current_round.result[i])
+            b_change = calc_elo(tournament_state["players"][black_name]["rating"],
+                                tournament_state["players"][white_name]["rating"],
+                                rev_score[current_round.result[i]])
+            elo_changes[white_name] = w_change; elo_changes[black_name] = b_change
+        elo_text = "Elo Updates\n" + "-" * (tournament_state["max_length"] + 26) + "\n"
+        for name, change in elo_changes.items():
+            old = tournament_state["players"][name]["rating"]
+            tournament_state["players"][name]["rating"] += change
+            new = tournament_state["players"][name]["rating"]
+            sign = "+" if change >= 0 else ""
+            elo_text += f"{name:<{tournament_state['max_length']}} | {old} → {new} ({sign}{change})\n"
+        print(CLR_INFO(elo_text))
+
         current_round.completed = True
         print(CLR_SUCCESS("Round Ended!"))
     else: print(CLR_ERROR("No round to end."))
 
 def cmd_save_state(args):
+    if not args: print(CLR_ERROR("Error: 'save' requires a filename. Usage: save <name>")); return
     # Create a 'deep' copy structure for serialization
     serialized_state = {
         "players": {},
@@ -192,7 +238,8 @@ def cmd_save_state(args):
             "rating": player_data["rating"],
             "score": player_data["score"],
             "opponents": list(player_data["opponents"]),  # set -> list
-            "color_history": player_data["color_history"]
+            "color_history": player_data["color_history"],
+            "suspended": player_data.get("suspended", False)
         }
 
     # Convert Round objects to dictionaries
@@ -209,6 +256,7 @@ def cmd_save_state(args):
     print(CLR_INFO(f"Saved as {file_name} successfully!"))
 
 def cmd_load_state(args):
+    if not args: print(CLR_ERROR("Error: 'load' requires a filename. Usage: load <name>")); return
     global tournament_state
     file_name = os.path.join(folder_dir, args[0])
     data = read_jfile(file_name)
@@ -223,7 +271,8 @@ def cmd_load_state(args):
             "rating": player_data["rating"],
             "score": player_data["score"],
             "opponents": set(player_data["opponents"]),  # list -> set
-            "color_history": player_data["color_history"]
+            "color_history": player_data["color_history"],
+            "suspended": player_data.get("suspended", False)
         }
 
     # Reconstruct Round class instances
@@ -237,9 +286,21 @@ def cmd_load_state(args):
 
 def cmd_loadlist(args):
     path = Path(folder_dir)
+    if not path.exists(): print(CLR_INFO("No saves found (Tournaments folder does not exist yet.)")); return
     print(CLR_INFO("Saves\n---------------"))
     for item in path.iterdir():
         print(item.name)
+
+def cmd_suspend(args):
+    if len(args) < 1: print(CLR_ERROR("Error: 'suspend' requires a player name.")); return
+    name = args[0]
+    if name not in tournament_state["players"]: print(CLR_ERROR(f"Error: Player '{name}' not found.")); return
+
+    player = tournament_state["players"][name]
+    player["suspended"] = not player.get("suspended", False)
+
+    if player["suspended"]: print(CLR_WARNING(f"{name} suspended, excluded from future pairings."))
+    else: print(CLR_SUCCESS(f"{name} reinstated, will be included in future pairings."))
 
 def cmd_export(args):
     num_rounds = len(tournament_state["Rounds"])
@@ -343,6 +404,7 @@ COMMAND_MAP = {
     "4": cmd_result_change, "res": cmd_result_change,
     "5": cmd_show_round, "show": cmd_show_round,
     "6": cmd_end_round, "end": cmd_end_round,
+    "7": cmd_suspend, "suspend": cmd_suspend,
     "h": cmd_help, "help": cmd_help,
     "s": cmd_save_state, "save": cmd_save_state,
     "l": cmd_load_state, "load": cmd_load_state,
@@ -353,7 +415,7 @@ COMMAND_MAP = {
 
 # Main Loop
 def main():
-    print(CLR_SUCCESS("Nexus Chess Pairing (CLI V.1.1) Initialized."))
+    print(CLR_SUCCESS("Nexus Chess Pairing (CLI V.1.2) Initialized."))
     print("Type 'h' or 'help' to see available commands.\n")
 
     while True:
@@ -368,12 +430,16 @@ def main():
             arguments = tokens[1:]
 
             # Map execution
-            if command_token in COMMAND_MAP:
-                COMMAND_MAP[command_token](arguments)
+            if command_token in COMMAND_MAP: COMMAND_MAP[command_token](arguments)
             else: print(CLR_ERROR(f"Unknown command '{command_token}'. Type 'help' for options."))
         except (KeyboardInterrupt, EOFError):
             print("\n")
             cmd_exit([])
+        except ValueError: print(CLR_ERROR("Error: Invalid argument type, check your values and try again."))
+        except IndexError: print(CLR_ERROR("Error: No round or player data available for that operation."))
+        except FileNotFoundError as e: print(CLR_ERROR(f"Error: File not found '{e}'"))
+        except KeyError as e: print(CLR_ERROR(f"Error: Player or field not found '{e}'"))
+        except Exception as e: print(CLR_ERROR(f"Unexpected error: {type(e).__name__}: {e}"))
 
 if __name__ == "__main__":
     main()
